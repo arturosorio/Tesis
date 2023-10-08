@@ -1,0 +1,896 @@
+---
+title: "Tesis"
+output: html_document
+---
+
+
+
+
+### Pruebas experimentales 
+
+Variaciones sobre e ~ N(), Exp, Un
+Variaciones sobre N: 100, 1000, 10000, 100000
+#### Modelo de regresión simple: 
+
+$$y = 3x + 5 + e$$
+#### Modelo polinomial simple 
+
+$$y = 3x^2 + 5 + e$$
+
+#### Modelo multivariado con interacciones
+
+$$y = \exp(x_1) + x_2x_3^2 + log(|x_4 + x_5|) + e$$
+#### Ecuación de Friedman
+
+$$y = 10sin(\pi x_1x_2) + 20(x_3 - 0.5)^2 + 10x_4 + 5x_5 +  e $$
+
+
+1.00, 0.43, 0.45, −0.29, −0.69,
+0.43, 1.00, 0.25, −0.36, −0.36,
+0.45, −0.36, 1.00, −0.91, −0.36,
+−0.29, −0.36, −0.91, 1.00, 0.49,
+−0.69, −0.36, −0.36, 0.49, 1.00
+
+
+con $mu = [0.1,0.2,0,0.05,1.2]$ y $\Sigma=
+\begin{pmatrix}
+1.00& 0.43& 0.45& −0.29& −0.69\\
+0.43& 1.00& 0.25& −0.36& −0.36\\
+0.45& −0.36& 1.00& −0.91& −0.36\\
+−0.29& −0.36& −0.91& 1.00& 0.49\\
+−0.69& −0.36& −0.36& 0.49& 1.00
+\end{pmatrix}
+$ 
+
+
+```{r, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+#library(AmesHousing)
+library(gt)
+library(quantreg)
+library(MASS)
+library(ProbCast)
+library(mboost)
+library(future.apply)
+library(ranger)
+library(conformalInference)
+
+
+fmt_if_number <- function(..., digits = 2) {
+  input <- c(...)
+  fmt <- paste0("%.", digits, "f")
+  if (is.numeric(input))   return(sprintf(fmt, input))
+  return(input)
+}
+```
+
+
+### Criterios de evaluación
+
+
+```{r}
+PICP <- function(upper, lower, y) {
+   mean(ifelse(y >= upper & y <= lower, 1, 0))
+}
+
+MPIW <- function(upper, lower) {
+  mean(upper - lower) 
+}
+
+NMPIW <- function(upper, lower, y) {
+  MPIW(upper, lower)/(max(y) - min(y))
+}
+
+```
+
+
+
+### Generación de Datasets 
+
+#### Simulados 
+```{r}
+
+
+gen_linear_data <- function(n, e_f, ...) {
+  
+  x <- runif(n)
+  e <- e_f(n, ...) 
+  y <- 2*x + 1 + e
+  
+  tibble::tibble(y = y, x1 = x)
+}
+
+gen_piecewise_data <- function(n, e_f, ...) {
+  x <- runif(n)
+  y <- numeric(n)
+  for (i in 1:n) {
+    if (x[i] <= 1/3) {
+      y[i] <- 3 * x[i]
+    } else if (x[i] <= 2/3) {
+      y[i] <- -3 * x[i] + 2
+    } else {
+      y[i] <- x[i] + 1
+    }
+  }
+  e <- e_f(n, ...) 
+  y <- y + e 
+  tibble::tibble(y = y, x1 = x)
+}
+
+gen_mult_data <- function(n, e_f,...) {
+  
+  mu = c(0.1,0.2,0,0.05,1.2)
+  SIGMA = matrix(c(1.00, 0.43, 0.45, -0.29, -0.69,
+                   0.43, 1.00, 0.25, -0.36, -0.36,
+                   0.45, -0.36, 1.00, -0.91, -0.36,
+                  -0.29, -0.36, -0.91, 1.00, 0.49,
+                  -0.69, -0.36, -0.36, 0.49, 1.00), ncol=5)
+  data <- MASS::mvrnorm(n = n, mu = mu, Sigma = SIGMA)
+  names_ <- c("x1", "x2", "x3", "x4", "x5")
+  data <- as_tibble(data)
+  #print(data)
+  colnames(data) <- names_
+  #print(data)
+  e <- e_f(n, ...)
+  data <- data %>% 
+    mutate(y = exp(x1) + x2*x3^2 + log(abs(x4+x5)) + e)
+  
+  data
+  
+  
+  
+}
+
+
+gen_friedman_data <- function(n, e_f, ...) { 
+  x1 <- runif(n) 
+  x2 <- runif(n) 
+  x3 <- runif(n) 
+  x4 <- runif(n) 
+  x5 <- runif(n) 
+  
+  e <- e_f(n, ...)
+  
+  y <- 10*sin(pi*x1*x2) + 20*(x3 - 0.5)^2 + 10*x4 + 5*x5 + e
+  
+  tibble::tibble(y=y,x1=x1, x2=x2, x3=x3, x4=x4,
+                 x5=x5)
+  
+  
+}
+
+```
+
+```{r}
+ranger.funs = function() {
+  
+  # Check for randomForest
+  if (!require("ranger",quietly=TRUE)) {
+    stop("Package randomForest not installed (required here)!")
+  }
+  
+  # Check arguments
+  #check.pos.int(ntree)
+  #check.num.01(varfrac)
+  #check.bool(replace)
+  #check.num.01(obsfrac)
+  #check.pos.int(nodesize)
+  
+  train.fun = function(x,y,out=NULL) {
+    n = nrow(x)
+    p = ncol(x)
+    data = data.frame(y = y, as.data.frame(x)) %>% 
+      rename_with(~gsub("^V", "x", .), starts_with("V"))
+    return(ranger(y ~ ., data))
+  }
+  
+  predict.fun = function(out,newx) {
+    pred_data = as.data.frame(newx) %>% 
+      rename_with(~gsub("^V", "x", .), starts_with("V"))
+    return(predict(out,pred_data)$predictions)
+  }
+  
+  active.fun = function(out) {
+    return(list(which(out$importance>0)))
+  }
+  
+  return(list(train.fun=train.fun, predict.fun=predict.fun,
+              active.fun=active.fun))
+}
+```
+
+
+
+variaciones errores 
+
+n(0,1), t5, u(-1,1), exp(1) - 1, 0.9N(0,1) + 0.1N(0,100)
+```{r}
+
+
+rexp_menus_1 <- function(n,...){
+  rexp(n, ...) - 1
+}
+
+rn_comb <- function(n, ...){
+  0.9 * rnorm(n, mean = 0, sd = 1) + 0.1 * rnorm(n, mean = 0, sd = 100)
+}
+
+```
+
+
+```{r}
+gen_linear_data(10000, rnorm, 0, 1) %>% 
+  ggplot(aes(x1,y)) + geom_point() + geom_smooth(method = "lm")
+```
+
+
+```{r}
+gen_piecewise_data(10000, rnorm, 0.2, 0.25) %>% 
+  ggplot(aes(x1,y)) + geom_point() 
+```
+
+
+#### Real Datasets 
+
+
+#### Training
+
+
+```{r}
+  
+rang_funcs = ranger.funs()
+  
+## ranger + conformal
+confor_model <- function(data, conf = 0.20) {
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+
+  preds = conformal.pred.split(train %>% dplyr::select(-y), train$y, as.matrix(test %>% dplyr::select(-y)), alpha=1-conf,
+                                   train.fun=rang_funcs$train.fun, predict.fun=rang_funcs$predict.fun)
+  vals <-  preds[1:3] %>% as.data.frame()
+  colnames(vals) <- c(".pred", ".pred_lower", ".pred_upper")
+  test %>% 
+    bind_cols(vals) %>% 
+    relocate(.pred,y) %>% 
+    mutate(model = "RF + Conformational")
+  
+  
+}
+
+### Linear Model
+lin_model <- function(data, conf = 0.20){
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+  model_recipe <- recipe(y ~., data = train)
+  lm_mod <- linear_reg() %>% 
+  set_engine("lm") %>% 
+  set_mode("regression")
+
+  wf <- workflow() %>% 
+  add_model(lm_mod) %>%
+  add_recipe(model_recipe) %>% 
+  fit(train)
+  
+  preds_points  <- predict(
+  workflows::extract_fit_parsnip(wf),
+  workflows::extract_recipe(wf) %>% bake(test))
+  predict(
+  workflows::extract_fit_parsnip(wf),
+  workflows::extract_recipe(wf) %>% bake(test),
+  type = "pred_int",
+  level = conf) %>% 
+  bind_cols(relocate(test, y), preds_points) %>% 
+  relocate(.pred,y) %>% 
+  mutate(model = "LM")}
+
+
+### BART MODEL
+bart_model <- function(data, conf = 0.20){
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+  model_recipe <- recipe(y ~., data = train)
+  mod_bart <- parsnip::bart() %>% 
+  set_engine("dbarts",nthread= 4) %>% 
+  set_mode("regression")
+
+  wf <- workflows::workflow() %>% 
+  workflows::add_model(mod_bart) %>% 
+  add_recipe(model_recipe) %>% 
+  fit(train)
+  
+  preds_points  <- predict(
+  workflows::extract_fit_parsnip(wf),
+  workflows::extract_recipe(wf) %>% bake(test))
+  predict(
+  workflows::extract_fit_parsnip(wf),
+  workflows::extract_recipe(wf) %>% bake(test),
+  type = "pred_int",
+  level = conf) %>% 
+  bind_cols(relocate(test, y), preds_points) %>% 
+  relocate(.pred,y) %>% 
+  mutate(model = "BART")
+}
+
+### RF MODEL
+rf_model <- function(data, conf = 0.20){
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+  model_recipe <- recipe(y ~., data = train)
+  mod_rf <- parsnip::rand_forest() %>% 
+  set_engine(engine = "ranger", quantreg = TRUE) %>%
+  set_mode("regression")
+
+  wf <- workflows::workflow() %>% 
+  workflows::add_model(mod_rf) %>% 
+  add_recipe(model_recipe) %>% 
+  fit(train)
+  
+  u <- 1 - (1-conf)/2
+  l <- (1-conf)/2
+  #upper_ <- beta_ + lower_ 
+  preds <- predict(wf$fit$fit$fit, test, type = "quantiles",
+                     quantiles = c(l, 0.5, u))$predictions
+  preds <- as_tibble(preds)
+  colnames(preds) <- c(".pred_lower", ".pred", ".pred_upper")
+  test %>% 
+  bind_cols(preds) %>% 
+  relocate(.pred,y) %>% 
+  mutate(model = "RF")
+}
+
+### QR
+qr_model <- function(data, conf = 0.90) {
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+  u <- 1 - (1-conf)/2
+  l <- (1-conf)/2
+  mod_qr <- quantreg::rq(y ~ ., data =train , tau = c(l,0.5,u))
+  preds <- predict(mod_qr, test)
+  colnames(preds) <- c(".pred_lower", ".pred", ".pred_upper")
+  test %>% 
+  bind_cols(preds) %>% 
+  relocate(.pred,y)  %>% 
+  mutate(model = "QR")
+}
+
+### GBM
+gbm_model <- function(data, conf) {
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+  u <- 1 - (1-conf)/2
+  l <- (1-conf)/2
+  m<- ProbCast::qreg_gbm(train, y ~ ., quantiles = c(l, 0.5, u))
+  #mod_gbm <- mboost::blackboost(formula = y ~ ., data = train, family = QuantReg(tau = l, qoffset = 0.05),
+  #                 control = boost_control(mstop = 500, nu = 0.1,
+  #                                        risk = c("inbag", "oobag", "none"), stopintern = FALSE,
+  #                                        center = TRUE, trace = FALSE))
+  #mod_gbm2 <- mboost::blackboost(formula = y ~ ., data = train, family = QuantReg(tau = u, qoffset = 0.05),
+  #                            control = boost_control(mstop = 500, nu = 0.1,
+  #                                                    risk = c("inbag", "oobag", "none"), stopintern = FALSE,
+  #                                                    center = TRUE, trace = FALSE))
+  
+  #mod_gbm3 <- mboost::blackboost(formula = y ~ ., data = train, family = QuantReg(tau = 0.5, qoffset = 0.05),
+  #                             control = boost_control(mstop = 500, nu = 0.1,
+  #                                                     risk = c("inbag", "oobag", "none"), stopintern = FALSE,
+  #                                                     center = TRUE, trace = FALSE))
+  
+  #preds <- tibble(.pred_lower = as.numeric(predict(mod_gbm, test)), 
+  #                 .pred = as.numeric(predict(mod_gbm3, test)),
+  #                 .pred_upper = as.numeric(predict(mod_gbm2, test)))
+  preds <- predict(m, test)
+  colnames(preds) <- c(".pred_lower", ".pred", ".pred_upper")
+  test %>% 
+  bind_cols(preds) %>% 
+  relocate(.pred,y) %>% 
+  mutate(model = "GBM")
+}
+
+
+model_wrapper <- function(model, data, conf) {
+  
+  #A <- bench::mark(model(data, conf), iterations = 5, min_time = Inf)
+  init <- Sys.time()
+  parial <- model(data, conf) %>% 
+         mutate(covered_lm = ifelse(y >= .pred_lower & y <= .pred_upper, 1, 0),
+         mean_int = (.pred_upper - .pred_lower),
+         rmse = ((y-.pred))^2) %>% 
+         summarise(PIPC = mean(covered_lm), NMPIW = mean(mean_int), 
+         rmse = sqrt(mean(rmse)), rsq = rsq_vec(.pred, y),
+         y_mean = mean(y),
+         n_obs = n(),
+         model_name = unique(model))
+  timing_ <- Sys.time() - init
+  print(timing_)
+  
+  bind_cols(parial, 
+         #mem_aloc = A$mem_alloc, 
+         #median_t = A$median,
+         #total_time = A$total_time, 
+         #n_iters = A$n_itr, 
+         expected_c = conf) %>% 
+    mutate(timing = timing_)-> C
+  
+  C
+  
+}
+
+eval_models <- function(data, model, n, conf = 0.9) { 
+  map_dfr(future_replicate(n,model_wrapper(model, data, conf = conf), simplify = FALSE), bind_rows)
+  
+  }
+
+```
+
+#### Pruebas
+
+Datos : 100, 1000, 10000
+Errores: Norm, Unif, t5, NormComb, Exp
+Coberturas: 90, 95
+Modelos: Lin, GBM, RF, QR, BART
+
+```{r}
+models <- list(linear = lin_model, rf = rf_model, gbm = gbm_model, qr = qr_model, bart = bart_model, conformal = confor_model)
+```
+
+
+#### Datos lineales
+##### 100
+
+```{r}
+linear_data_norm <- gen_linear_data(100, rnorm, 0, 1)
+linear_data_unif <- gen_linear_data(100, runif, -1, 1)
+#linear_data_t5 <- gen_linear_data(100, rt, 5)
+#linear_data_norm_comb <- gen_linear_data(100, rn_comb)
+linear_data_exp <- gen_linear_data(100, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+              #t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+
+```
+
+
+```{r}
+dataframes_linear_100 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+  
+  for (m in names(models)) {
+    
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>% 
+      mutate(error = e, conf = c)
+    dataframes_linear_100[[paste0(e, m,c)]] <- data_par
+    
+  }
+  
+}
+}
+
+
+dataframe_lin_100 <- bind_rows(dataframes_linear_100)
+rm(dataframes_linear_100)
+write_csv(dataframe_lin_100, "100_linear_mod.csv")
+
+  
+```
+
+
+##### 1000
+
+```{r}
+linear_data_norm <- gen_linear_data(1000, rnorm, 0, 1)
+linear_data_unif <- gen_linear_data(1000, runif, -1, 1)
+#linear_data_t5 <- gen_linear_data(1000, rt, 5)
+#linear_data_norm_comb <- gen_linear_data(1000, rn_comb)
+linear_data_exp <- gen_linear_data(1000, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+              #t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+dataframes_linear_1000 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+
+  for (m in names(models)) {
+
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>%
+      mutate(error = e, conf = c)
+    dataframes_linear_1000[[paste0(e, m,c)]] <- data_par
+
+  }
+
+}
+}
+dataframe_lin_1000 <- bind_rows(dataframes_linear_1000)
+write_csv(dataframe_lin_1000, "1000_linear_mod.csv")
+rm(dataframes_linear_1000)
+
+```
+
+##### 10000
+
+```{r}
+linear_data_norm <- gen_linear_data(10000, rnorm, 0, 1)
+linear_data_unif <- gen_linear_data(10000, runif, -1, 1)
+#linear_data_t5 <- gen_linear_data(10000, rt, 5)
+#linear_data_norm_comb <- gen_linear_data(10000, rn_comb)
+linear_data_exp <- gen_linear_data(10000, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+             # t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+ dataframes_linear_10000 <- list()
+ for (c in c(0.9, 0.95)) {
+ for (e in names(datos)) {
+   
+   for (m in names(models)) {
+     
+     data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>% 
+       mutate(error = e, conf = c)
+     dataframes_linear_10000[[paste0(e, m,c)]] <- data_par
+     
+   }
+   
+ }
+ }
+ dataframe_lin_10000 <- bind_rows(dataframes_linear_10000)
+ write_csv(dataframe_lin_10000, "10000_linear_mod.csv")
+ rm(dataframes_linear_10000)
+```
+
+
+
+
+#### Data POL
+
+##### 100
+
+```{r}
+linear_data_norm <- gen_piecewise_data(100, rnorm, 0, 1)
+linear_data_unif <- gen_piecewise_data(100, runif, -1, 1)
+#linear_data_t5 <- gen_piecewise_data(100, rt, 5)
+#linear_data_norm_comb <- gen_piecewise_data(100, rn_comb)
+linear_data_exp <- gen_piecewise_data(100, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+             # t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+dataframes_pol_100 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+  
+  for (m in names(models)) {
+    
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>% 
+      mutate(error = e, conf = c)
+    dataframes_pol_100[[paste0(e, m,c)]] <- data_par
+    
+  }
+  
+}
+}
+
+
+dataframe_pol_100 <- bind_rows(dataframes_pol_100)
+rm(dataframes_pol_100)
+write_csv(dataframe_pol_100, "100_pol_mod.csv")
+```
+
+##### 1000
+
+```{r}
+linear_data_norm <- gen_piecewise_data(1000, rnorm, 0, 1)
+linear_data_unif <- gen_piecewise_data(1000, runif, -1, 1)
+#linear_data_t5 <- gen_piecewise_data(1000, rt, 5)
+#linear_data_norm_comb <- gen_piecewise_data(1000, rn_comb)
+linear_data_exp <- gen_piecewise_data(1000, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+ #             t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+dataframes_pol_1000 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+
+  for (m in names(models)) {
+
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>%
+      mutate(error = e, conf = c)
+    dataframes_pol_1000[[paste0(e, m,c)]] <- data_par
+
+  }
+
+}
+}
+
+dataframe_pol_1000 <- bind_rows(dataframes_pol_1000)
+write_csv(dataframe_pol_1000, "1000_pol_mod.csv")
+rm(dataframes_pol_1000)
+
+```
+
+
+##### 10000
+```{r}
+linear_data_norm <- gen_piecewise_data(10000, rnorm, 0, 1)
+linear_data_unif <- gen_piecewise_data(10000, runif, -1, 1)
+#linear_data_t5 <- gen_piecewise_data(10000, rt, 5)
+#linear_data_norm_comb <- gen_piecewise_data(10000, rn_comb)
+linear_data_exp <- gen_piecewise_data(10000, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+              #t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+dataframes_pol_10000 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+
+  for (m in names(models)) {
+
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>%
+      mutate(error = e, conf = c)
+    dataframes_pol_10000[[paste0(e, m,c)]] <- data_par
+
+  }
+
+}
+}
+
+dataframe_pol_10000 <- bind_rows(dataframes_pol_10000)
+write_csv(dataframe_pol_10000, "10000_pol_mod.csv")
+rm(dataframes_pol_10000)
+
+```
+
+
+#### Data mult
+
+#### 100
+
+```{r}
+linear_data_norm <- gen_mult_data(100, rnorm, 0, 1)
+linear_data_unif <- gen_mult_data(100, runif, -1, 1)
+#linear_data_t5 <- gen_mult_data(100, rt, 5)
+#linear_data_norm_comb <- gen_mult_data(100, rn_comb)
+linear_data_exp <- gen_mult_data(100, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+#              t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+dataframes_mult_100 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+  
+  for (m in names(models)) {
+    
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>% 
+      mutate(error = e, conf = c)
+    dataframes_mult_100[[paste0(e, m,c)]] <- data_par
+    
+  }
+  
+}
+}
+
+
+dataframe_mult_100 <- bind_rows(dataframes_mult_100)
+rm(dataframes_mult_100)
+write_csv(dataframe_mult_100, "mult_100_mod.csv")
+```
+
+#### 1000
+
+```{r}
+linear_data_norm <- gen_mult_data(1000, rnorm, 0, 1)
+linear_data_unif <- gen_mult_data(1000, runif, -1, 1)
+#linear_data_t5 <- gen_mult_data(1000, rt, 5)
+#linear_data_norm_comb <- gen_mult_data(1000, rn_comb)
+linear_data_exp <- gen_mult_data(1000, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+             # t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+dataframes_mult_1000 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+
+  for (m in names(models)) {
+
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>%
+      mutate(error = e, conf = c)
+    dataframes_mult_1000[[paste0(e, m,c)]] <- data_par
+
+  }
+
+}
+}
+
+
+dataframe_mult_1000 <- bind_rows(dataframes_mult_1000)
+rm(dataframes_mult_1000)
+write_csv(dataframe_mult_1000, "mult_1000_mod.csv")
+```
+
+
+
+#### 10000
+
+```{r}
+linear_data_norm <- gen_mult_data(10000, rnorm, 0, 1)
+linear_data_unif <- gen_mult_data(10000, runif, -1, 1)
+#linear_data_t5 <- gen_mult_data(10000, rt, 5)
+#linear_data_norm_comb <- gen_mult_data(10000, rn_comb)
+linear_data_exp <- gen_mult_data(10000, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+ #             t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+dataframes_mult_10000 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+
+  for (m in names(models)) {
+
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>%
+      mutate(error = e, conf = c)
+    dataframes_mult_10000[[paste0(e, m,c)]] <- data_par
+
+  }
+
+}
+}
+
+
+dataframe_mult_10000 <- bind_rows(dataframes_mult_10000)
+write_csv(dataframe_mult_10000, "mult_10000_mod.csv")
+rm(dataframes_mult_10000)
+```
+
+
+
+
+#### Data Friedman
+
+#### 100
+
+```{r}
+linear_data_norm <- gen_friedman_data(100, rnorm, 0, 1)
+linear_data_unif <- gen_friedman_data(100, runif, -1, 1)
+#linear_data_t5 <- gen_friedman_data(100, rt, 5)
+#linear_data_norm_comb <- gen_friedman_data(100, rn_comb)
+linear_data_exp <- gen_friedman_data(100, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+#              t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+dataframes_friedman_100 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+
+  for (m in names(models)) {
+
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>%
+      mutate(error = e, conf = c)
+    dataframes_friedman_100[[paste0(e, m,c)]] <- data_par
+
+  }
+
+}
+}
+
+
+dataframe_friedman_100 <- bind_rows(dataframes_friedman_100)
+rm(dataframes_friedman_100)
+write_csv(dataframe_friedman_100, "fried_100_mod.csv")
+
+```
+
+#### 1000
+
+```{r}
+linear_data_norm <- gen_friedman_data(1000, rnorm, 0, 1)
+linear_data_unif <- gen_friedman_data(1000, runif, -1, 1)
+#linear_data_t5 <- gen_friedman_data(1000, rt, 5)
+#linear_data_norm_comb <- gen_friedman_data(1000, rn_comb)
+linear_data_exp <- gen_friedman_data(1000, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+            #  t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+dataframes_friedman_1000 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+
+  for (m in names(models)) {
+
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>%
+      mutate(error = e, conf = c)
+    dataframes_friedman_1000[[paste0(e, m,c)]] <- data_par
+
+  }
+
+}
+}
+
+
+dataframe_friedman_1000 <- bind_rows(dataframes_friedman_1000)
+rm(dataframes_friedman_1000)
+write_csv(dataframe_friedman_1000, "fried_1000_mod.csv")
+```
+
+
+##### 10000
+
+```{r}
+linear_data_norm <- gen_friedman_data(10000, rnorm, 0, 1)
+linear_data_unif <- gen_friedman_data(10000, runif, -1, 1)
+#linear_data_t5 <- gen_friedman_data(10000, rt, 5)
+#linear_data_norm_comb <- gen_friedman_data(10000, rn_comb)
+linear_data_exp <- gen_friedman_data(10000, rexp_menus_1)
+
+datos <- list(norm = linear_data_norm, unif = linear_data_unif, 
+         #     t5 = linear_data_t5,  comb = linear_data_norm_comb, 
+              exp = linear_data_exp)
+```
+
+```{r}
+dataframes_friedman_10000 <- list()
+for (c in c(0.9, 0.95)) {
+for (e in names(datos)) {
+
+  for (m in names(models)) {
+
+    data_par <- eval_models(50, data = datos[[e]], model = models[[m]], conf = c) %>%
+      mutate(error = e, conf = c)
+    dataframes_friedman_10000[[paste0(e, m,c)]] <- data_par
+
+  }
+
+}
+}
+
+
+dataframe_friedman_10000 <- bind_rows(dataframes_friedman_10000)
+write_csv(dataframe_friedman_10000, "fried_10000_mod.csv")
+rm(dataframes_friedman_10000)
+```
+
+
+

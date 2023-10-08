@@ -1,0 +1,329 @@
+---
+title: "Analisis"
+output: 
+  html_document:
+    fig_height: 4
+    fig_width: 5
+    dpi: 300
+    graphics: tikz
+date: "2023-04-11"
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+library(tidyverse)
+library(wesanderson)
+library(xtable)
+colors <- c("#E6A0C4", "#D8A499", "#7294D4", "#3F5000", "#0B775E", "#0C1707")
+```
+
+```{r}
+wes_palettes
+```
+
+```{r}
+list.files(pattern = "*.csv")
+```
+
+
+```{r}
+
+dataframe <- data.frame()
+for (file in  list.files(pattern = "*.csv")) {
+
+  sub_data <- read_csv(file)
+  dataframe <-  bind_rows(dataframe, sub_data %>% 
+                            mutate(data_name =strsplit(file, split = "_")[[1]][1]))
+  
+  
+}
+
+
+```
+
+```{r}
+dataframe <- dataframe %>% 
+  rename(n_vol = n_obs) %>% 
+  mutate(n_vol = case_when(n_vol == 28 ~ "100", 
+                           n_vol == 252 ~ "1000", 
+                           n_vol == 2500 ~ "10000"), 
+         model_name = case_when(model_name == "RF + Conformational" ~ "RF + Conf", 
+                                TRUE ~ model_name))
+
+dataframe$model_name <- relevel(as.factor(dataframe$model_name), ref = "LM")
+dataframe$error <- relevel(as.factor(dataframe$error), ref = "norm")
+```
+
+```{r}
+dataframe %>% 
+  select(model_name) %>% 
+  unique()
+```
+
+
+### 
+Resultamos en metricas (rmse, rsq)
+Resultados PICP
+Resultados WITDH
+
+
+```{r}
+
+make_grap_rmse <- function(dataframe, name, conff, metric) {
+  
+  if (metric %in% c("rmse", "rsq")) {
+    dataframe <- dataframe %>% filter(!model_name %in% c("RF + Conf"))
+  } 
+   p <- dataframe %>% 
+ filter(data_name == name, conf == conff) %>% 
+  ggplot(aes(n_vol, get(metric))) + 
+  geom_boxplot(aes(fill = error)) +
+  facet_grid(~model_name) +
+  #geom_hline(yintercept = 0.90)+
+  theme_minimal() + 
+  theme(legend.position = "top", axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = "# Obs", y = str_to_title(metric)) +
+  scale_fill_manual(values = colors)
+  
+  if (metric == "PIPC") {
+    p <- p + geom_hline(yintercept = conff, color = "red")
+  }
+   
+   p
+
+   
+}
+
+dd_ <- dataframe %>% select(data_name) %>% unique() %>% pull(data_name)
+  
+```
+```{r}
+
+```
+
+
+
+```{r}
+for (i in dd_){
+  print(i)
+  print(make_grap_rmse(dataframe, name = i,0.90, "rsq"))
+}
+
+```
+
+```{r}
+dataframe %>% 
+ filter(data_name == "linear", conf == 0.90) %>% 
+ group_by(model_name,n_vol, error ) %>% 
+ summarise(mrsq= mean(rsq)) %>% 
+ arrange(desc(mrsq))
+```
+
+
+
+### Covertura al 90
+```{r}
+for (i in dd_){
+  print(i)
+  print(make_grap_rmse(dataframe, name = i,0.90, "PIPC"))
+}
+
+```
+
+### Covertura al 95
+```{r}
+
+for (i in dd_){
+  print(i)
+  print(make_grap_rmse(dataframe, name = i,0.95, "PIPC"))
+}
+
+```
+
+```{r}
+for (i in dd_){
+  print(i)
+  print(make_grap_rmse(dataframe, name = i,0.95, "PIPC"))
+}
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+make_table_mpiw <- function(dataframe, name, conff) {
+  t<- dataframe %>% 
+  filter(data_name == name, conf == conff) %>% 
+  mutate(CWC = NMPIW * (1 + ifelse(PIPC>conf, 0, 1)*exp(-0*(PIPC - conf)))) %>% 
+  mutate(CWC = round(CWC,2))  %>% 
+  #filter(PIPC >= conff) %>% 
+  group_by(model_name, error, n_vol) %>% 
+  summarise(mean_nmp = mean(NMPIW), sd_nmp = sd(NMPIW), mean_cwc = mean(CWC)) %>% 
+  arrange(error,n_vol, mean_cwc, mean_nmp) %>%
+  ungroup() %>% 
+  group_by(error, n_vol) %>% 
+  #filter(obs > 0.3) %>% 
+  top_n(n = 2, wt = 1/mean_cwc) %>% 
+  arrange(error, n_vol, mean_cwc) %>% 
+  #select(-obs) %>% 
+  mutate(Pos = row_number()) %>% 
+  rename(Modelo = model_name, Errores = error, 
+         "# Obs" = n_vol, "Media MPIW" = mean_nmp, "SD MPIW" = sd_nmp,
+         "Media CWC" = mean_cwc) %>% 
+  xtable(caption = paste0("Confianza al ", conff))
+  
+  print(t, type = "latex", include.rownames = FALSE)
+  
+}
+
+make_table_mpiw2 <- 
+function(dataframe, name, conff, lambda) {
+  t<- dataframe %>% 
+  filter(data_name == name, conf == conff) %>% 
+  mutate(CWC = NMPIW * (1 + ifelse(PIPC>=conf, 0, 1)*exp(-lambda*(PIPC - conf)))) %>% 
+  mutate(CWC = round(CWC,2))  %>% 
+  #filter(PIPC >= conff) %>% 
+  group_by(model_name, error, n_vol) %>% 
+  summarise(mean_nmp = mean(NMPIW), sd_nmp = sd(NMPIW), mean_cwc = mean(CWC), obs = sum(PIPC >= conf)/50) %>% 
+  arrange(error,n_vol, mean_cwc, mean_nmp) %>%
+  ungroup() %>% 
+  group_by(error, n_vol) %>% 
+  #filter(obs > 0.3) %>% 
+  top_n(n = 6, wt = 1/mean_cwc) %>% 
+  arrange(error, n_vol, mean_cwc) %>% 
+  #select(-obs) %>% 
+  mutate(Pos = row_number()) %>% 
+  rename(Modelo = model_name, Errores = error, 
+         "# Obs" = n_vol, "Media MPIW" = mean_nmp, "SD MPIW" = sd_nmp,
+         "Media CWC" = mean_cwc) 
+  #xtable(caption = paste0("Confianza al ", conff))
+  
+  #print(t, type = "latex", include.rownames = FALSE)
+  t
+  
+}
+
+```
+
+```{r}
+make_table_mpiw(dataframe, "linear", 0.90, 0)
+```
+
+```{r}
+dataframe %>% 
+  filter(data_name == "linear", conf == 0.9) %>% 
+  mutate(CWC = NMPIW * (1 + ifelse(PIPC>conf, 0, 1)*exp(-50*(PIPC - conf)))) %>% 
+  mutate(CWC = round(CWC,2)) %>% 
+  ggplot(aes(n_vol, CWC)) + 
+  geom_boxplot(aes(model_name)) +
+  facet_wrap(~error)
+```
+
+
+```{r}
+dataframe
+```
+
+
+```{r}
+
+make_plot_pos <- function(lambda, data, conf) {
+make_table_mpiw2(dataframe, data, conf, lambda) %>% 
+  group_by(Modelo, `# Obs`, Errores ) %>% 
+  summarise(POS = mean(Pos), OBS = mean(obs), M = mean(`Media MPIW`)) %>% 
+  mutate(lambda = lambda)}
+
+
+data_base_lambda <- data.frame()
+
+
+make_data_lamda <- function(data, conf) {
+data_base_lambda <- data.frame()
+for (lambda in seq(0, 100, 10)){
+    
+    data_ <- make_plot_pos(lambda, data, conf)
+    data_base_lambda <- bind_rows(data_base_lambda, data_)
+}
+  data_base_lambda 
+}
+
+
+```
+```{r}
+make_plot_lambda <- function(data, conf) 
+  {make_data_lamda(data, conf)%>% 
+  ggplot(aes(lambda, POS)) + geom_line(aes(color = Modelo), size = 1.2) + 
+  theme_minimal() + 
+  facet_wrap(Errores~`# Obs`) +
+  theme(legend.position = "top", axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = "Eta", y = str_to_title("Posicion Relativa")) +
+  scale_color_manual(values = colors)}
+```
+
+```{r}
+make_plot_lambda("fried", 0.90)
+```
+
+```{r}
+for (i in dd_){
+  print(i)
+  print(make_plot_lambda(i, 0.95))
+}
+```
+
+```{r}
+for (i in dd_){
+  print(i)
+  print(make_plot_lambda(i, 0.90))
+}
+```
+
+
+
+```{r}
+dataframe %>% 
+  filter(data_name == "linear", conf == 0.90) %>% 
+  mutate(CWC = NMPIW * (1 + ifelse(PIPC>conf, 0, 1)*exp(-50*(PIPC - conf)))) %>% 
+  mutate(CWC = round(CWC,2)) %>% 
+  filter(CWC < 100) %>% 
+  ggplot(aes(n_vol, CWC)) +
+  geom_boxplot(aes(fill = error)) +
+  facet_grid(~model_name) +
+  #geom_hline(yintercept = 0.90)+
+  theme_minimal() + 
+  theme(legend.position = "top", axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = "# Obs", y = str_to_title("CWC")) +
+  scale_fill_manual(values = colors)
+```
+
+```{r}
+make_table_mpiw(dataframe, "mult", 0.90)
+```
+
+
+### Tablas al 90 
+
+```{r}
+for (i in dd_){
+  print(i)
+  make_table_mpiw(dataframe, i, 0.90)
+}
+```
+## Tablas al 95
+```{r}
+for (i in dd_){
+  print(i)
+  make_table_mpiw(dataframe, i, 0.95)
+}
+```
+
+
+

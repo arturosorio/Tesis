@@ -1,0 +1,347 @@
+---
+title: "Caso de Uso"
+output: 
+  html_document:
+    fig_height: 4
+    fig_width: 5
+    dpi: 300
+    graphics: tikz
+date: "2023-04-11"
+---
+
+```{r}
+# Carga de bibliotecas
+library(tidymodels)
+library(tidyverse)
+library(dbplyr)
+library(knitr)
+library(kableExtra)
+
+# Carga del conjunto de datos de concreto
+library(readxl)
+concrete_data <- read_excel("Concrete_Data.xls")
+colnames(concrete_data) <- c("cement", "blast_furnace_slag", "fly_ash", "water", "superplasticizer", "coarse_aggregate", "fine_aggregate", "age", "compressive_strength")
+
+```
+
+```{r}
+lin_model <- function(data, conf = 0.20){
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+  model_recipe <- recipe(y ~., data = train)
+  lm_mod <- linear_reg() %>% 
+  set_engine("lm") %>% 
+  set_mode("regression")
+
+  wf <- workflow() %>% 
+  add_model(lm_mod) %>%
+  add_recipe(model_recipe) %>% 
+  fit(train)
+  
+  preds_points  <- predict(
+  workflows::extract_fit_parsnip(wf),
+  workflows::extract_recipe(wf) %>% bake(test))
+  predict(
+  workflows::extract_fit_parsnip(wf),
+  workflows::extract_recipe(wf) %>% bake(test),
+  type = "pred_int",
+  level = conf) %>% 
+  bind_cols(relocate(test, y), preds_points) %>% 
+  relocate(.pred,y) %>% 
+  mutate(model = "LM")}
+
+
+### BART MODEL
+bart_model <- function(data, conf = 0.20){
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+  model_recipe <- recipe(y ~., data = train)
+  mod_bart <- parsnip::bart() %>% 
+  set_engine("dbarts",nthread= 4) %>% 
+  set_mode("regression")
+
+  wf <- workflows::workflow() %>% 
+  workflows::add_model(mod_bart) %>% 
+  add_recipe(model_recipe) %>% 
+  fit(train)
+  
+  preds_points  <- predict(
+  workflows::extract_fit_parsnip(wf),
+  workflows::extract_recipe(wf) %>% bake(test))
+  predict(
+  workflows::extract_fit_parsnip(wf),
+  workflows::extract_recipe(wf) %>% bake(test),
+  type = "pred_int",
+  level = conf) %>% 
+  bind_cols(relocate(test, y), preds_points) %>% 
+  relocate(.pred,y) %>% 
+  mutate(model = "BART")
+}
+
+### RF MODEL
+rf_model <- function(data, conf = 0.20){
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+  model_recipe <- recipe(y ~., data = train)
+  mod_rf <- parsnip::rand_forest() %>% 
+  set_engine(engine = "ranger", quantreg = TRUE) %>%
+  set_mode("regression")
+
+  wf <- workflows::workflow() %>% 
+  workflows::add_model(mod_rf) %>% 
+  add_recipe(model_recipe) %>% 
+  fit(train)
+  
+  u <- 1 - (1-conf)/2
+  l <- (1-conf)/2
+  #upper_ <- beta_ + lower_ 
+  preds <- predict(wf$fit$fit$fit, test, type = "quantiles",
+                     quantiles = c(l, 0.5, u))$predictions
+  preds <- as_tibble(preds)
+  colnames(preds) <- c(".pred_lower", ".pred", ".pred_upper")
+  test %>% 
+  bind_cols(preds) %>% 
+  relocate(.pred,y) %>% 
+  mutate(model = "RF")
+}
+
+### QR
+qr_model <- function(data, conf = 0.90) {
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+  u <- 1 - (1-conf)/2
+  l <- (1-conf)/2
+  mod_qr <- quantreg::rq(y ~ ., data =train , tau = c(l,0.5,u))
+  preds <- predict(mod_qr, test)
+  colnames(preds) <- c(".pred_lower", ".pred", ".pred_upper")
+  test %>% 
+  bind_cols(preds) %>% 
+  relocate(.pred,y)  %>% 
+  mutate(model = "QR")
+}
+
+### GBM
+gbm_model <- function(data, conf) {
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+  u <- 1 - (1-conf)/2
+  l <- (1-conf)/2
+  m<- ProbCast::qreg_gbm(train, y ~ ., quantiles = c(l, 0.5, u))
+  #mod_gbm <- mboost::blackboost(formula = y ~ ., data = train, family = QuantReg(tau = l, qoffset = 0.05),
+  #                 control = boost_control(mstop = 500, nu = 0.1,
+  #                                        risk = c("inbag", "oobag", "none"), stopintern = FALSE,
+  #                                        center = TRUE, trace = FALSE))
+  #mod_gbm2 <- mboost::blackboost(formula = y ~ ., data = train, family = QuantReg(tau = u, qoffset = 0.05),
+  #                            control = boost_control(mstop = 500, nu = 0.1,
+  #                                                    risk = c("inbag", "oobag", "none"), stopintern = FALSE,
+  #                                                    center = TRUE, trace = FALSE))
+  
+  #mod_gbm3 <- mboost::blackboost(formula = y ~ ., data = train, family = QuantReg(tau = 0.5, qoffset = 0.05),
+  #                             control = boost_control(mstop = 500, nu = 0.1,
+  #                                                     risk = c("inbag", "oobag", "none"), stopintern = FALSE,
+  #                                                     center = TRUE, trace = FALSE))
+  
+  #preds <- tibble(.pred_lower = as.numeric(predict(mod_gbm, test)), 
+  #                 .pred = as.numeric(predict(mod_gbm3, test)),
+  #                 .pred_upper = as.numeric(predict(mod_gbm2, test)))
+  preds <- predict(m, test)
+  colnames(preds) <- c(".pred_lower", ".pred", ".pred_upper")
+  test %>% 
+  bind_cols(preds) %>% 
+  relocate(.pred,y) %>% 
+  mutate(model = "GBM")
+}
+
+
+model_wrapper <- function(model, data, conf) {
+  
+  #A <- bench::mark(model(data, conf), iterations = 5, min_time = Inf)
+  init <- Sys.time()
+  parial <- model(data, conf) %>% 
+         mutate(covered_lm = ifelse(y >= .pred_lower & y <= .pred_upper, 1, 0),
+         mean_int = (.pred_upper - .pred_lower),
+         rmse = ((y-.pred))^2) %>% 
+         summarise(PIPC = mean(covered_lm), NMPIW = mean(mean_int), 
+         rmse = sqrt(mean(rmse)), rsq = rsq_vec(.pred, y),
+         y_mean = mean(y),
+         n_obs = n(),
+         model_name = unique(model))
+  timing_ <- Sys.time() - init
+  print(timing_)
+  
+  bind_cols(parial, 
+         #mem_aloc = A$mem_alloc, 
+         #median_t = A$median,
+         #total_time = A$total_time, 
+         #n_iters = A$n_itr, 
+         expected_c = conf) %>% 
+    mutate(timing = timing_)-> C
+  
+  C
+  
+}
+
+eval_models <- function(data, model, n, conf = 0.9) { 
+  map_dfr(future_replicate(n,model_wrapper(model, data, conf = conf), simplify = FALSE), bind_rows)
+  
+  }
+```
+
+
+```{r}
+  
+ranger.funs = function() {
+  
+  # Check for randomForest
+  if (!require("ranger",quietly=TRUE)) {
+    stop("Package randomForest not installed (required here)!")
+  }
+  
+  # Check arguments
+  #check.pos.int(ntree)
+  #check.num.01(varfrac)
+  #check.bool(replace)
+  #check.num.01(obsfrac)
+  #check.pos.int(nodesize)
+  
+  train.fun = function(x,y,out=NULL) {
+    n = nrow(x)
+    p = ncol(x)
+    data = data.frame(y = y, as.data.frame(x)) %>% 
+      rename_with(~gsub("^V", "x", .), starts_with("V"))
+    return(ranger(y ~ ., data))
+  }
+  
+  predict.fun = function(out,newx) {
+    pred_data = as.data.frame(newx) %>% 
+      rename_with(~gsub("^V", "x", .), starts_with("V"))
+    return(predict(out,pred_data)$predictions)
+  }
+  
+  active.fun = function(out) {
+    return(list(which(out$importance>0)))
+  }
+  
+  return(list(train.fun=train.fun, predict.fun=predict.fun,
+              active.fun=active.fun))
+}
+
+rang_funcs = ranger.funs()
+  
+## ranger + conformal
+confor_model <- function(data, conf = 0.20) {
+  data_split <- initial_split(data = data, prop = 0.75, strata = "y")
+  train <- training(data_split)
+  test  <- testing(data_split) 
+
+  preds = conformal.pred.split(train %>% dplyr::select(-y), train$y, as.matrix(test %>% dplyr::select(-y)), alpha=1-conf,
+                                   train.fun=rang_funcs$train.fun, predict.fun=rang_funcs$predict.fun)
+  vals <-  preds[1:3] %>% as.data.frame()
+  colnames(vals) <- c(".pred", ".pred_lower", ".pred_upper")
+  test %>% 
+    bind_cols(vals) %>% 
+    relocate(.pred,y) %>% 
+    mutate(model = "RF + Conformational")
+  
+  
+}
+```
+
+```{r}
+models <- list(linear = lin_model, rf = rf_model, gbm = gbm_model, qr = qr_model, bart = bart_model, conformal = confor_model)
+```
+
+```{r}
+concrete_data_long <- concrete_data %>%
+  gather(key = "variable", value = "value") %>%
+  group_by(variable) %>%
+  summarize(mean = mean(value),
+            sd = sd(value),
+            min = min(value),
+            max = max(value),
+            n = n()) %>%
+  ungroup()
+```
+```{r}
+concrete_data_long
+```
+
+```{r}
+model_data <- concrete_data %>% 
+  rename(y = compressive_strength)
+```
+
+
+
+
+```{r}
+
+nms <- names(models)
+final_datasets_ <- data.frame()
+
+for (model in nms) { 
+  if (model == "conformal") {
+    print("NA")
+  }
+  else {
+  data_m <- models[[model]](model_data, 0.95)
+  final_datasets_ <- bind_rows(final_datasets_, data_m) }
+  
+  }
+```
+
+```{r}
+final_datasets_
+```
+
+
+```{r}
+
+colors <- c( "#D8A499", "#7294D4","#E6A0C4", "#3F5000", "#0B775E", "#0C1707")
+final_datasets_ %>% 
+  rename(Y = y, Pred = .pred) %>% 
+  ggplot(aes(Pred, Y)) + 
+  geom_point(aes(col = model)) +
+  geom_errorbar(aes(ymin = .pred_lower, ymax = .pred_upper, col = model), width = 0.5, alpha = 0.5) +
+  #scale_y_continuous(limits = c(0,90)) + 
+  #scale_x_continuous(limits = c(0,0)) +
+  facet_grid(~model, scales = "fixed") +
+  #labs(x = "Eta", y = str_to_title("Posicion Relativa")) +
+  scale_color_manual(values = colors) +
+  theme_minimal() +
+  theme(legend.position = "None", axis.text.x = element_text(angle = 60, hjust = 1)) 
+  
+```
+
+```{r}
+nms <- names(models)
+final_datasets_s <- data.frame()
+
+for (model in nms) { 
+  if (model == "conformal") {
+    print("NA")
+  }
+  else {
+  data_m <- model_wrapper(models[[model]], model_data, conf = 0.95)
+  final_datasets_s <- bind_rows(final_datasets_s, data_m) }
+  
+  }
+
+```
+
+```{r}
+latex_modelos <- final_datasets_s %>% 
+  dplyr::select(-n_obs, -timing, -expected_c, -y_mean) %>% 
+  rename(Modelo = model_name)  %>% 
+  kable(format = "latex", booktabs = TRUE, caption = "Resultados de los Modelos")
+  #kable_styling(latex_options = "scale_down")
+
+# Guardar la tabla en un archivo .tex
+cat(latex_modelos, file = "modelos_table.tex")
+```
+
